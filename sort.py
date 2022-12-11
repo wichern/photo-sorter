@@ -89,8 +89,6 @@ class MediaFile(object):
         self.name, self.extension = os.path.splitext(os.path.basename(path))
         self.extension = self.extension[1:]  # remove the '.'
 
-        logging.debug(f'Loading {path} ({self.name}/{self.extension}')
-
     def _address2location(self, address) -> str:
         if 'suburb' in address:
             return address['suburb']
@@ -154,8 +152,7 @@ class MediaFile(object):
                 else:
                     duplicate += 1
             else:
-                logging.debug(f'{self.path} -> {dst}')
-                logging.info(dst)
+                logging.info(' -> ' + dst)
                 shutil.copyfile(self.path, dst)
                 break
 
@@ -163,7 +160,10 @@ class MediaFile(object):
         if self.name.startswith('IMG_'):
             logging.debug(f'Guess date from "{self.name}"')
             try:
-                return datetime.datetime.strptime(self.name.split('_')[1], '%Y%m%d')
+                date = datetime.datetime.strptime(self.name.split('_')[1], '%Y%m%d')
+                # Validate
+                if date.year >= 1990 and date.year <= datetime.date.today().year:
+                    return date
             except ValueError:
                 return None
         return None
@@ -178,6 +178,8 @@ class Image(MediaFile):
 
         if not self.extension.lower() in IMAGE_FILE_EXTENSIONS:
             raise NotAnImageException()
+
+        logging.info(f'Loading {path}')
 
         self.exif = self.__read_exif()
         self.location = self.__location(locations)
@@ -197,24 +199,29 @@ class Image(MediaFile):
         if 'GPSInfo' in self.exif:
             gpsinfo = self.exif['GPSInfo']
 
-            degrees, minutes, seconds = gpsinfo[2]
-            latitude = float(degrees) + float(minutes) / float(60) + float(seconds) / float(3600)
+            try:
+                degrees, minutes, seconds = gpsinfo[2]
+                latitude = float(degrees) + float(minutes) / float(60) + float(seconds) / float(3600)
 
-            degrees, minutes, seconds = gpsinfo[4]
-            longitude = float(degrees) + float(minutes) / float(60) + float(seconds) / float(3600)
+                degrees, minutes, seconds = gpsinfo[4]
+                longitude = float(degrees) + float(minutes) / float(60) + float(seconds) / float(3600)
 
-            return super()._address2location(locations.address(latitude, longitude))
+                return super()._address2location(locations.address(latitude, longitude))
+            except KeyError:
+                logging.error(f'{self.path}: GPSInfo not as expected: "{str(gpsinfo)}"')
         return None
 
     def __date(self):
-        if 'DateTimeOriginal' in self.exif:
-            datetimeorig = self.exif['DateTimeOriginal'] 
-            try:
-                return datetime.datetime.strptime(datetimeorig, '%Y:%m:%d %H:%M:%S')
-            except ValueError:
-                logging.error(f'Unknown datetime in exif data of {self.path}: "{datetimeorig}"')
-                # Continue to guess by filename
-        return super()._guess_date_by_filename()
+        # We value the date encoded in the filename more than the one in the exif data.
+        date = super()._guess_date_by_filename()
+        if not date:
+            if 'DateTimeOriginal' in self.exif:
+                datetimeorig = self.exif['DateTimeOriginal'] 
+                try:
+                    return datetime.datetime.strptime(datetimeorig, '%Y:%m:%d %H:%M:%S')
+                except ValueError:
+                    logging.error(f'Unknown datetime in exif data of {self.path}: "{datetimeorig}"')
+        return date
 
 class Movie(MediaFile):
     def __init__(self, path: str, locations: GeoLocator):
@@ -223,32 +230,40 @@ class Movie(MediaFile):
         if not self.extension.lower() in MOVIE_FILE_EXTENSIONS:
             raise NotAMovieException()
 
+        logging.info(f'Loading {path}')
+
         self.metadata = self.__read_metadata()
         self.location = self.__location(locations)
         self.date = self.__date()
 
     def __read_metadata(self):
-        return ffmpeg.probe(self.path)
+        try:
+            return ffmpeg.probe(self.path)
+        except Exception as ffmpeg_exception:
+            logging.error(f'{self.path}: Reading metadata failed: "{str(ffmpeg_exception)}"')
+            return dict()
 
     def __date(self):
-        if 'format' in self.metadata:
-            format = self.metadata['format']
-            if 'tags' in format:
-                tags = format['tags']
-                if 'creation_time' in tags:
-                    creation_time = tags['creation_time']
-                    try:
-                        return datetime.datetime.strptime(creation_time, '%Y-%m-%dT%H:%M:%S.%f')
-                    except ValueError:
+        # We value the date encoded in the filename more than the one in the exif data.
+        date = super()._guess_date_by_filename()
+        if not date:
+            if 'format' in self.metadata:
+                format = self.metadata['format']
+                if 'tags' in format:
+                    tags = format['tags']
+                    if 'creation_time' in tags:
+                        creation_time = tags['creation_time']
                         try:
-                            return datetime.datetime.strptime(creation_time, '%Y-%m-%d %H:%M:%S')
+                            return datetime.datetime.strptime(creation_time, '%Y-%m-%dT%H:%M:%S.%f')
                         except ValueError:
                             try:
-                                return datetime.datetime.strptime(creation_time, '%Y-%m-%dT%H:%M:%S.%fZ')
+                                return datetime.datetime.strptime(creation_time, '%Y-%m-%d %H:%M:%S')
                             except ValueError:
-                                logging.error(f'Unknown date format in metadata of {self.path}: "{creation_time}".')
-                                # continue to try guessing by filename as backup
-        return super()._guess_date_by_filename()
+                                try:
+                                    return datetime.datetime.strptime(creation_time, '%Y-%m-%dT%H:%M:%S.%fZ')
+                                except ValueError:
+                                    logging.error(f'Unknown date format in metadata of {self.path}: "{creation_time}".')
+        return date
 
     def __iso6709(self, val: str) -> List[str]:
         ret = []
