@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
 '''
 Install ffmpeg (ffprobe.exe into this directory)
 pip install pillow geopy ffmpeg-python
 '''
 
+__author__ = "Paul Wichern"
+__license__ = "MIT"
+__version__ = "1.0.0"
+
 from typing import List
+import argparse
 import os
 import glob
-import sys
 import datetime
 import logging
 import pickle
 import shutil
 import filecmp
 import signal
+import traceback
 
 import ffmpeg
 import geopy
@@ -42,20 +48,20 @@ class GeoLocator():
     ''' This class can return the address of geolocation. '''
 
     pickle_file = 'coordinates.pickle'
-    coordinates = dict()
+    coordinates = {}
 
     def __init__(self, user_agent: str = 'fotos.py'):
         self.geolocator = geopy.geocoders.Nominatim(user_agent=user_agent)
 
         if os.path.exists(self.pickle_file):
             logging.info('Load %s ...', self.pickle_file)
-            with open(self.pickle_file, 'rb') as file:
-                self.coordinates = pickle.load(file)
+            with open(self.pickle_file, 'rb') as pfile:
+                self.coordinates = pickle.load(pfile)
 
     def persist(self):
         ''' Write already fetched locations into pickle file. '''
-        with open(self.pickle_file, 'wb') as file:
-            pickle.dump(self.coordinates, file)
+        with open(self.pickle_file, 'wb') as pfile:
+            pickle.dump(self.coordinates, pfile)
 
     def address(self, latitude: float, longitude: float):
         ''' Get address of geolocation '''
@@ -70,7 +76,7 @@ class GeoLocator():
             location = self.geolocator.reverse(f'{latitude},{longitude}').raw['address']
             self.coordinates[coordinates] = location
             self.persist()
-        except ValueError as value_error:
+        except ValueError:
             logging.error('lat: %s and lon: %s are not correct.', latitude, longitude)
             return None
 
@@ -85,12 +91,12 @@ class DuplicateException(Exception):
 class MediaFile(object):
     ''' Multimedia object (image or movie) '''
 
-    def __init__(self, path: str, locations: GeoLocator):
-        self.path = path
-        self.name, self.extension = os.path.splitext(os.path.basename(path))
+    def __init__(self, filepath: str, locations: GeoLocator):
+        self.path = filepath
+        self.name, self.extension = os.path.splitext(os.path.basename(filepath))
         self.extension = self.extension[1:]  # remove the '.'
         self.location = None
-        self.size = os.path.getsize(path)
+        self.size = os.path.getsize(filepath)
 
         if self.extension.lower() in ['jpg', 'jpeg', 'png']:
             self.exif = self.__read_exif()
@@ -107,17 +113,20 @@ class MediaFile(object):
         ''' Read image EXIF data '''
         try:
             img = PIL.Image.open(self.path)
-            img.load()
-            if img._getexif():
-                return { PIL.ExifTags.TAGS[k]: v
-                    for k, v in img._getexif().items() if k in PIL.ExifTags.TAGS }
+            img_exif = img._getexif()
+            if img_exif:
+                return {
+                    PIL.ExifTags.TAGS[k]: v
+                    for k, v in img_exif.items()
+                    if k in PIL.ExifTags.TAGS
+                }
         except OSError as os_error:
             logging.error(f'%s: %s', self.path, os_error)
         return {}
 
     def __exif_location(self, locations: GeoLocator) -> str:
         ''' Extract location from EXIF '''
-        if not 'GPSInfo' in self.exif:
+        if 'GPSInfo' not in self.exif:
             return None
 
         gpsinfo = self.exif['GPSInfo']
@@ -132,6 +141,7 @@ class MediaFile(object):
             return self.__address2location(locations.address(latitude, longitude))
         except KeyError:
             logging.error('%s: GPSInfo not as expected: "%s"', self.path, str(gpsinfo))
+            return None
 
     def __read_metadata(self):
         ''' Read metadata from movie file '''
@@ -139,7 +149,7 @@ class MediaFile(object):
             return ffmpeg.probe(self.path)
         except Exception as ffmpeg_exception:
             logging.error('%s: Reading metadata failed: "%s"', self.path, str(ffmpeg_exception))
-            return dict()
+            return {}
 
     def __metadata_date(self):
         ''' Extract date from movie metadata '''
@@ -182,6 +192,8 @@ class MediaFile(object):
             part += char
 
         if part != '':
+            if part.endswith('/'):
+                part = part[:-1]
             ret.append(part)
 
         return ret
@@ -209,8 +221,8 @@ class MediaFile(object):
                 locations.address(
                     float(geolocation[0]),
                     float(geolocation[1])))
-        else:
-            logging.error('%s: Unexpected location format in metadata: "%s"', self.path, location)
+        logging.error('%s: Unexpected location format in metadata: "%s"', self.path, location)
+        return None
 
     def __exif_date(self):
         ''' Get date from image exif data '''
@@ -236,8 +248,9 @@ class MediaFile(object):
         if 'suburb' in address:
             if 'village' in address:
                 return address['village'] + '_' + address['suburb']
-            else:
-                return address['suburb']
+            if 'town' in address:
+                return address['town'] + '_' + address['suburb']
+            return address['suburb']
         if 'village' in address:
             return address['village']
         if 'town' in address:
@@ -246,6 +259,7 @@ class MediaFile(object):
             return address['state']
         logging.warning('%s: Could not determine location from address: %s',
             self.path, str(address))
+        return None
 
     def __dest_directory(self, dst_base: str) -> str:
         ''' Return dest directory of this file '''
@@ -284,7 +298,8 @@ class MediaFile(object):
             dst = directory + '/' + filename
             if os.path.exists(dst):
                 if filecmp.cmp(dst, self.path):
-                    raise DuplicateException(f'{dst}: A file with the same name and content already exists.')
+                    raise DuplicateException(
+                        f'{dst}: A file with the same name and content already exists.')
                 duplicate += 1
             else:
                 logging.debug('%s -> %s', self.path, dst)
@@ -300,7 +315,16 @@ class MediaFile(object):
                 if date.year >= 1990 and date.year <= datetime.date.today().year:
                     return date
             except ValueError:
-                return None
+                pass
+        elif len(self.name) > 8:
+            # Sometimes filenames start with the date.
+            try:
+                date = datetime.datetime.strptime(self.name[:8], '%Y%m%d')
+                # Validate
+                if date.year >= 1990 and date.year <= datetime.date.today().year:
+                    return date
+            except ValueError:
+                pass
         return None
 
 # Whether to interrupt the sorting.
@@ -317,18 +341,29 @@ def signal_handler(signum, frame):
 signal.signal(signal.SIGINT, signal_handler)
 
 if __name__ == '__main__':
-    if len(sys.argv) < 3:
-        print(f'Usage: {sys.argv[0]} SRC_DIR DST_DIR')
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        prog = 'Photo Sorter',
+        description = 'Sort photos by date and location.')
+    parser.add_argument('source_directory', help='Directory from which to get the images.')
+    parser.add_argument('dest_directory', help='Directory to which to copy/sort the images to.')
+    parser.add_argument(
+        '-r', '--recursive',
+        help='Scan source directory recursively',
+        action='store_true')  # on/off flag
+    args = parser.parse_args()
 
-    SRC_DIR = sys.argv[1] + '/**'
-    dst_dir = sys.argv[2]
+    source_directory = args.source_directory
+    if args.recursive:
+        source_directory += '/**'
+    else:
+        source_directory += '/*'
 
     locator = GeoLocator()
 
-    logging.info('Scanning %s ...', SRC_DIR)
+    logging.info('Scanning %s ...', source_directory)
 
     stats = {
+        'source': source_directory,
         'paths': set(),
         'bytes': 0,
         'duplicates': 0
@@ -336,13 +371,15 @@ if __name__ == '__main__':
 
     # Try to load a previous state.
     if os.path.exists(INTERRUPT_PICKLE):
-        user_input = input('Continue interrupted run? [Yn]')
-        if user_input != 'n':
-            with open(INTERRUPT_PICKLE, 'rb') as file:
-                stats = pickle.load(file)
+        with open(INTERRUPT_PICKLE, 'rb') as file:
+            stats_loaded = pickle.load(file)
+            if stats_loaded['source'] == source_directory:
+                user_input = input('Continue interrupted run? [Yn]')
+                if user_input != 'n':
+                    stats = stats_loaded
 
     interrupted = False
-    for path in glob.iglob(SRC_DIR, recursive=True):
+    for path in glob.iglob(source_directory, recursive=True):
         if interrupt_sort:
             logging.info('Keyboard interrupt')
             with open(INTERRUPT_PICKLE, 'wb') as file:
@@ -365,7 +402,7 @@ if __name__ == '__main__':
 
         try:
             media = MediaFile(path, locator)
-            media.copy(dst_dir)
+            media.copy(args.dest_directory)
             stats['paths'].add(path)
             stats['bytes'] += media.size
         except geopy.exc.GeocoderUnavailable:
@@ -373,13 +410,15 @@ if __name__ == '__main__':
             interrupted = True
             break
         except UnknownMedia:
-            logging.warning('%s ignore', path)
+            logging.warning('%s ignored', path)
+            stats['paths'].add(path)
         except DuplicateException as duplicate_exception:
             logging.warning(duplicate_exception)
             stats['duplicates'] += 1
+            stats['paths'].add(path)
         except Exception as general_exception:
             # TODO: print whole stack
-            logging.error('Sorting media failed: %s', general_exception)
+            logging.error('Sorting media failed: %s\n%s', general_exception, traceback.format_exc())
             interrupted = True
             break
 
