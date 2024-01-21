@@ -25,9 +25,20 @@ class MediaFile(object):
 
         if self.extension.lower() in ['jpg', 'jpeg', 'png']:
             img = PIL.Image.open(self.path)
-            img.load()
-            if img._getexif():
-                pprint({ PIL.ExifTags.TAGS[k]: v for k, v in img._getexif().items() if k in PIL.ExifTags.TAGS })
+            img_exif = img._getexif()
+            if img_exif:
+                pprint({
+                    PIL.ExifTags.TAGS[k]: v
+                    for k, v in img_exif.items()
+                    if k in PIL.ExifTags.TAGS
+                })
+
+            # exif = img.getexif()
+            # for key, value in PIL.ExifTags.TAGS.items():
+            #     if value == 'GPSInfo':
+            #         break
+            # gps_info = exif.get_ifd(key)
+            # print({ PIL.ExifTags.GPSTAGS.get(key, key): value for key, value in gps_info.items() })
         elif self.extension.lower() in ['mp4', 'mov', 'avi' ]:
             pprint(ffmpeg.probe(self.path))
 
