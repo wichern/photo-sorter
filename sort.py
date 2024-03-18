@@ -12,12 +12,11 @@ TODO: Create simple graphical interface
 
 __author__ = "Paul Wichern"
 __license__ = "MIT"
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 from typing import List
 import argparse
 import os
-import glob
 import datetime
 import logging
 import pickle
@@ -25,6 +24,7 @@ import shutil
 import filecmp
 import signal
 import traceback
+import pathlib
 
 import ffmpeg
 import geopy
@@ -35,7 +35,7 @@ INTERRUPT_PICKLE = 'interrupt.pickle'
 
 # Setup logging to file
 logging.basicConfig(
-    filename='fotos.log',
+    filename='sort.log',
     level=logging.INFO,
     encoding='utf-8',
     format= '[%(asctime)s] {%(pathname)s:%(lineno)-3d} %(levelname)-8s - %(message)s',
@@ -51,20 +51,20 @@ logging.getLogger('').addHandler(console)
 class GeoLocator():
     ''' This class can return the address of geolocation. '''
 
-    pickle_file = 'coordinates.pickle'
+    pickle_path = pathlib.Path('coordinates.pickle')
     coordinates = {}
 
-    def __init__(self, user_agent: str = 'fotos.py'):
+    def __init__(self, user_agent: str = 'sort.py'):
         self.geolocator = geopy.geocoders.Nominatim(user_agent=user_agent)
 
-        if os.path.exists(self.pickle_file):
-            logging.info('Load %s ...', self.pickle_file)
-            with open(self.pickle_file, 'rb') as pfile:
+        if self.pickle_path.exists():
+            logging.info('Load %s ...', self.pickle_path)
+            with open(self.pickle_path, 'rb') as pfile:
                 self.coordinates = pickle.load(pfile)
 
     def persist(self):
         ''' Write already fetched locations into pickle file. '''
-        with open(self.pickle_file, 'wb') as pfile:
+        with open(self.pickle_path, 'wb') as pfile:
             pickle.dump(self.coordinates, pfile)
 
     def address(self, latitude: float, longitude: float):
@@ -95,18 +95,16 @@ class DuplicateException(Exception):
 class MediaFile(object):
     ''' Multimedia object (image or movie) '''
 
-    def __init__(self, filepath: str, locations: GeoLocator):
+    def __init__(self, filepath: pathlib.Path, locations: GeoLocator):
         self.path = filepath
-        self.name, self.extension = os.path.splitext(os.path.basename(filepath))
-        self.extension = self.extension[1:]  # remove the '.'
         self.location = None
         self.size = os.path.getsize(filepath)
 
-        if self.extension.lower() in ['jpg', 'jpeg', 'png']:
+        if self.path.suffix.lower() in ['.jpg', '.jpeg', '.png']:
             self.exif = self.__read_exif()
             self.location = self.__exif_location(locations)
             self.date = self.__exif_date()
-        elif self.extension.lower() in ['mp4', 'mov', 'avi' ]:
+        elif self.path.suffix.lower() in ['.mp4', '.mov', '.avi' ]:
             self.metadata = self.__read_metadata()
             self.location = self.__metadata_location(locations)
             self.date = self.__metadata_date()
@@ -125,7 +123,7 @@ class MediaFile(object):
                     if k in PIL.ExifTags.TAGS
                 }
         except OSError as os_error:
-            logging.error(f'%s: %s', self.path, os_error)
+            logging.error(f'Error reading EXIF: %s: %s', self.path, os_error)
         return {}
 
     def __exif_location(self, locations: GeoLocator) -> str:
@@ -265,65 +263,77 @@ class MediaFile(object):
             self.path, str(address))
         return None
 
-    def __dest_directory(self, dst_base: str) -> str:
+    def __dest_directory(self, dst_base: pathlib.Path) -> pathlib.Path:
         ''' Return dest directory of this file '''
         directory = dst_base
 
         if self.date:
-            directory += self.date.strftime('/%Y/%m')
+            directory /= self.date.strftime('%Y/%m')
         else:
-            directory += '/0000'
+            directory /= '0000'
 
         if self.location:
-            directory += '/' + self.location
+            directory /= self.location
 
         return directory
 
-    def __dest_name(self, duplicate: int) -> str:
+    def __dest_name(self, duplicate: int) -> pathlib.Path:
         ''' Get the dest file name '''
         if 0 == duplicate:
-            return f'{self.name}.{self.extension}'
-        return f'{self.name}_{duplicate}.{self.extension}'
-
-    def copy(self, dst_base: str):
-        ''' Copy the file into its dest directory '''
+            return self.path.name
+        return pathlib.Path(f'{self.path.stem}_{duplicate}{self.path.suffix}')
+    
+    def dest_path(self, dst_base: pathlib.Path) -> pathlib.Path:
         # Get full dest directory
         directory = self.__dest_directory(dst_base)
-
-        # Create dest directory
-        if not os.path.exists(directory):
-            os.makedirs(directory)
+        dst = pathlib.Path()
 
         # Add a suffix to the filename until a new filename was found.
         duplicate = 0
         while True:
             filename = self.__dest_name(duplicate)
-
-            dst = directory + '/' + filename
-            if os.path.exists(dst):
+            dst = directory / filename
+            if dst.exists():
                 if filecmp.cmp(dst, self.path):
                     raise DuplicateException(
-                        f'{dst}: A file with the same name and content already exists.')
+                        f'already exists at {dst}')
                 duplicate += 1
             else:
-                logging.debug('%s -> %s', self.path, dst)
-                shutil.copyfile(self.path, dst)
                 break
+        
+        return dst
+
+    def copy(self, dst: pathlib.Path):
+        ''' Copy the file into its dest directory '''
+
+        # Create dest directory
+        if not dst.parent.exists():
+            os.makedirs(dst.parent)
+    
+        shutil.copyfile(self.path, dst)
 
     def __guess_date_by_filename(self):
         ''' Guess the media date by its filename '''
-        if self.name.startswith('IMG_'):
+        if self.path.stem.startswith('IMG_') or self.path.stem.startswith('MOV_'):
             try:
-                date = datetime.datetime.strptime(self.name.split('_')[1], '%Y%m%d')
+                date = datetime.datetime.strptime(self.path.stem.split('_')[1], '%Y%m%d')
                 # Validate
                 if date.year >= 1990 and date.year <= datetime.date.today().year:
                     return date
             except ValueError:
                 pass
-        elif len(self.name) > 8:
+        elif self.path.stem.startswith('FILE'):
+            try:
+                date = datetime.datetime.strptime(self.path.stem[4:10], '%y%m%d')
+                # Validate
+                if date.year >= 1990 and date.year <= datetime.date.today().year:
+                    return date
+            except ValueError:
+                pass
+        elif len(self.path.stem) > 8:
             # Sometimes filenames start with the date.
             try:
-                date = datetime.datetime.strptime(self.name[:8], '%Y%m%d')
+                date = datetime.datetime.strptime(self.path.stem[:8], '%Y%m%d')
                 # Validate
                 if date.year >= 1990 and date.year <= datetime.date.today().year:
                     return date
@@ -344,26 +354,28 @@ def signal_handler(signum, frame):
 # Define signal handler
 signal.signal(signal.SIGINT, signal_handler)
 
-if __name__ == '__main__':
+def main():
     parser = argparse.ArgumentParser(
         prog = 'Photo Sorter',
         description = 'Sort photos by date and location.')
-    parser.add_argument('source_directory', help='Directory from which to get the images.')
-    parser.add_argument('dest_directory', help='Directory to which to copy/sort the images to.')
+    parser.add_argument('source_directory', help='Directory from which to get the images.', type=pathlib.Path)
+    parser.add_argument('dest_directory', help='Directory to which to copy/sort the images to.', type=pathlib.Path)
     parser.add_argument(
         '-r', '--recursive',
         help='Scan source directory recursively',
-        action='store_true')  # on/off flag
+        action='store_true')
+    parser.add_argument(
+        '--dryrun',
+        help='Do a dry run without any actual changes',
+        action='store_true')
     args = parser.parse_args()
 
     source_directory = args.source_directory
-    if args.recursive:
-        source_directory += '/**'
-    else:
-        source_directory += '/*'
 
+    logging.info('Init GeoLocator ...')
     locator = GeoLocator()
 
+    logging.info('Output: %s', args.dest_directory)
     logging.info('Scanning %s ...', source_directory)
 
     stats = {
@@ -383,7 +395,11 @@ if __name__ == '__main__':
                     stats = stats_loaded
 
     interrupted = False
-    for path in glob.iglob(source_directory, recursive=True):
+    pattern = '*'
+    if args.recursive:
+        pattern = '**/*'
+    files = [f for f in source_directory.glob(pattern) if os.path.isfile(f)]
+    for path in files:
         if interrupt_sort:
             logging.info('Keyboard interrupt')
             with open(INTERRUPT_PICKLE, 'wb') as file:
@@ -394,19 +410,30 @@ if __name__ == '__main__':
         if path in stats['paths']:
             continue
 
-        # Only interested in files
-        if not os.path.isfile(path):
-            continue
-
-        logging.info('[%s, %.2fGB, %sdups] %s', 
-            len(stats['paths']),
-            stats['bytes'] / 1024 / 1024 / 1024,
-            stats['duplicates'],
-            path)
-
         try:
-            media = MediaFile(path, locator)
-            media.copy(args.dest_directory)
+            media = MediaFile(pathlib.Path(path), locator)
+            dst_path = pathlib.Path()
+            try:
+                dst_path = media.dest_path(args.dest_directory)
+                logging.info('[%d/%s, %.2fGB, %sdups] %s -> %s', 
+                    1 + len(stats['paths']),
+                    len(files),
+                    stats['bytes'] / 1024 / 1024 / 1024,
+                    stats['duplicates'],
+                    path,
+                    dst_path)
+            except DuplicateException as de:
+                logging.info('[%d/%s, %.2fGB, %sdups] %s (%s)', 
+                    1 + len(stats['paths']),
+                    len(files),
+                    stats['bytes'] / 1024 / 1024 / 1024,
+                    stats['duplicates'],
+                    path,
+                    de)
+                raise de
+            
+            if not args.dryrun:
+                media.copy(dst_path)
             stats['paths'].add(path)
             stats['bytes'] += media.size
         except geopy.exc.GeocoderUnavailable:
@@ -414,10 +441,14 @@ if __name__ == '__main__':
             interrupted = True
             break
         except UnknownMedia:
-            logging.warning('%s ignored', path)
+            logging.warning('[%d/%s, %.2fGB, %sdups] %s (ignored)', 
+                1 + len(stats['paths']),
+                len(files),
+                stats['bytes'] / 1024 / 1024 / 1024,
+                stats['duplicates'],
+                path)
             stats['paths'].add(path)
-        except DuplicateException as duplicate_exception:
-            logging.warning(duplicate_exception)
+        except DuplicateException:
             stats['duplicates'] += 1
             stats['paths'].add(path)
         except Exception as general_exception:
@@ -434,3 +465,6 @@ if __name__ == '__main__':
         if os.path.exists(INTERRUPT_PICKLE):
             logging.info('Remove %s', INTERRUPT_PICKLE)
             os.remove(INTERRUPT_PICKLE)
+
+if __name__ == '__main__':
+    main()
